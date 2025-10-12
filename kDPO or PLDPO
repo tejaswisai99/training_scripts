@@ -1,0 +1,480 @@
+"""
+Complete Implementation of Plackett-Luce DPO for SQL Generation
+Using TRL/Hugging Face with Custom Loss
+
+This includes:
+1. Data preparation
+2. Custom Plackett-Luce loss implementation
+3. Training with TRL DPOTrainer (modified)
+4. Alternative: Custom trainer from scratch
+"""
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from trl import DPOTrainer, DPOConfig
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+import json
+
+# ============================================================================
+# PART 1: DATA FORMAT & PREPARATION
+# ============================================================================
+
+# Example data format you would have:
+example_data = {
+    "prompt": "Generate SQL query for: Get all users who signed up in the last 30 days",
+    "schema": "CREATE TABLE users (id INT, name VARCHAR, signup_date DATE)",
+    "candidates": [
+        "SELECT * FROM users WHERE signup_date >= DATE_SUB(CURRENT_DATE, INTERVAL 30 DAY)",
+        "SELECT * FROM users WHERE signup_date >= NOW() - INTERVAL 30 DAY", 
+        "SELECT id, name FROM users WHERE DATEDIFF(CURRENT_DATE, signup_date) <= 30",
+        "SELECT * FROM users WHERE signup_date > CURRENT_DATE - 30",
+        "SELECT * FROM users WHERE signup_date >= CURRENT_DATE - INTERVAL '30 days'"
+    ],
+    "scores": [0.95, 0.90, 0.85, 0.60, 0.70],  # Execution-based scores
+    "ranking": [0, 1, 2, 4, 3]  # Indices sorted by score (best to worst)
+}
+
+def prepare_dataset(data_path: str) -> List[Dict]:
+    """Load and prepare dataset in the required format"""
+    dataset = []
+    
+    with open(data_path, 'r') as f:
+        for line in f:
+            item = json.loads(line)
+            
+            # Convert to messages format
+            processed = {
+                "prompt": [
+                    {"role": "system", "content": "You are an expert SQL developer."},
+                    {"role": "user", "content": f"Schema:\n{item['schema']}\n\nQuestion: {item['prompt']}"}
+                ],
+                "candidates": item['candidates'],
+                "scores": item['scores'],
+                "ranking": item['ranking']
+            }
+            dataset.append(processed)
+    
+    return dataset
+
+# ============================================================================
+# PART 2: CUSTOM PLACKETT-LUCE LOSS IMPLEMENTATION
+# ============================================================================
+
+class PlackettLuceDPOLoss:
+    """
+    Plackett-Luce variant of DPO loss for k-way rankings
+    
+    Standard DPO (Bradley-Terry):
+    L = -log(sigmoid(β * (log π_θ(y_w) - log π_θ(y_l) - log π_ref(y_w) + log π_ref(y_l))))
+    
+    Plackett-Luce DPO:
+    For ranking τ = [y1, y2, ..., yK]:
+    L = -Σ_i log(π_θ(y_τ(i)) / Σ_{j≥i} π_θ(y_τ(j))) + β * KL(π_θ || π_ref)
+    """
+    
+    def __init__(self, beta: float = 0.1):
+        self.beta = beta
+    
+    def compute_loss(
+        self,
+        policy_logprobs: torch.Tensor,  # [K] - log probs from policy model
+        ref_logprobs: torch.Tensor,     # [K] - log probs from reference model
+        ranking: List[int],              # [K] - ranking indices (best to worst)
+    ) -> torch.Tensor:
+        """
+        Compute Plackett-Luce DPO loss for a single example
+        
+        Args:
+            policy_logprobs: Log probabilities from current policy for K candidates
+            ref_logprobs: Log probabilities from reference policy for K candidates
+            ranking: Indices of candidates sorted by preference (best first)
+        
+        Returns:
+            Scalar loss value
+        """
+        K = len(ranking)
+        
+        # Reorder by ranking
+        policy_logprobs_ranked = policy_logprobs[ranking]
+        ref_logprobs_ranked = ref_logprobs[ranking]
+        
+        # Compute log policy ratios: log(π_θ / π_ref)
+        log_ratios = policy_logprobs_ranked - ref_logprobs_ranked
+        
+        # Plackett-Luce likelihood
+        # For each position i, compute: log(exp(log_ratio[i]) / sum(exp(log_ratio[j]) for j >= i))
+        # This is equivalent to: log_ratio[i] - logsumexp(log_ratio[i:])
+        
+        pl_losses = []
+        for i in range(K):
+            # Probability that y_i is chosen from remaining candidates {y_i, ..., y_K}
+            numerator = self.beta * log_ratios[i]
+            denominator = torch.logsumexp(self.beta * log_ratios[i:], dim=0)
+            pl_losses.append(numerator - denominator)
+        
+        # Total loss is negative log-likelihood
+        loss = -torch.stack(pl_losses).sum()
+        
+        return loss
+    
+    def compute_loss_with_scores(
+        self,
+        policy_logprobs: torch.Tensor,
+        ref_logprobs: torch.Tensor,
+        scores: torch.Tensor,  # Quality scores for weighting
+    ) -> torch.Tensor:
+        """
+        Score-weighted Plackett-Luce loss
+        Give more weight to distinctions between high-quality candidates
+        """
+        # Create ranking from scores
+        ranking = torch.argsort(scores, descending=True)
+        
+        # Compute standard PL loss
+        base_loss = self.compute_loss(policy_logprobs, ref_logprobs, ranking.tolist())
+        
+        # Optional: Weight by score differences
+        # This emphasizes learning differences between high-quality solutions
+        score_weights = F.softmax(scores[ranking], dim=0)
+        
+        return base_loss  # Can add weighting if desired
+
+# ============================================================================
+# PART 3: CUSTOM DATASET CLASS
+# ============================================================================
+
+class PlackettLuceDataset(Dataset):
+    """Dataset for Plackett-Luce DPO training"""
+    
+    def __init__(self, data: List[Dict], tokenizer, max_length: int = 2048):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        
+        # Format prompt
+        prompt_text = self.tokenizer.apply_chat_template(
+            item['prompt'],
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        
+        # Tokenize candidates
+        candidates_encoded = []
+        for candidate in item['candidates']:
+            full_text = prompt_text + candidate
+            encoded = self.tokenizer(
+                full_text,
+                max_length=self.max_length,
+                truncation=True,
+                padding=False,
+                return_tensors=None
+            )
+            candidates_encoded.append(encoded)
+        
+        return {
+            'prompt': prompt_text,
+            'candidates': candidates_encoded,
+            'scores': torch.tensor(item['scores']),
+            'ranking': item['ranking']
+        }
+
+# ============================================================================
+# PART 4: CUSTOM TRAINER WITH PLACKETT-LUCE LOSS
+# ============================================================================
+
+class PlackettLuceDPOTrainer(Trainer):
+    """Custom trainer implementing Plackett-Luce DPO"""
+    
+    def __init__(self, ref_model, beta: float = 0.1, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ref_model = ref_model
+        self.ref_model.eval()
+        self.pl_loss = PlackettLuceDPOLoss(beta=beta)
+        
+        # Freeze reference model
+        for param in self.ref_model.parameters():
+            param.requires_grad = False
+    
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """Compute Plackett-Luce DPO loss"""
+        
+        candidates = inputs['candidates']
+        scores = inputs['scores']
+        ranking = inputs['ranking']
+        
+        batch_size = len(candidates)
+        total_loss = 0
+        
+        for b in range(batch_size):
+            # Get K candidates for this example
+            K = len(candidates[b])
+            
+            policy_logprobs = []
+            ref_logprobs = []
+            
+            # Compute log probabilities for each candidate
+            for k in range(K):
+                input_ids = candidates[b][k]['input_ids'].unsqueeze(0).to(model.device)
+                attention_mask = candidates[b][k]['attention_mask'].unsqueeze(0).to(model.device)
+                
+                # Policy model forward pass
+                with torch.cuda.amp.autocast():
+                    policy_outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask
+                    )
+                    policy_logprobs.append(
+                        self._get_sequence_logprob(policy_outputs.logits, input_ids)
+                    )
+                
+                # Reference model forward pass
+                with torch.no_grad():
+                    ref_outputs = self.ref_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask
+                    )
+                    ref_logprobs.append(
+                        self._get_sequence_logprob(ref_outputs.logits, input_ids)
+                    )
+            
+            # Stack into tensors
+            policy_logprobs = torch.stack(policy_logprobs)
+            ref_logprobs = torch.stack(ref_logprobs)
+            
+            # Compute Plackett-Luce loss for this example
+            loss = self.pl_loss.compute_loss(
+                policy_logprobs,
+                ref_logprobs,
+                ranking[b]
+            )
+            
+            total_loss += loss
+        
+        # Average over batch
+        total_loss = total_loss / batch_size
+        
+        return (total_loss, None) if return_outputs else total_loss
+    
+    def _get_sequence_logprob(self, logits, input_ids):
+        """Compute log probability of the sequence"""
+        # Shift for next-token prediction
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = input_ids[..., 1:].contiguous()
+        
+        # Get log probabilities
+        log_probs = F.log_softmax(shift_logits, dim=-1)
+        
+        # Gather log probs for actual tokens
+        token_log_probs = torch.gather(
+            log_probs,
+            dim=-1,
+            index=shift_labels.unsqueeze(-1)
+        ).squeeze(-1)
+        
+        # Sum over sequence (or mean)
+        return token_log_probs.sum()
+
+# ============================================================================
+# PART 5: SIMPLIFIED PAIRWISE APPROACH (Using TRL Directly)
+# ============================================================================
+
+def convert_to_pairwise_dpo(data: List[Dict]) -> List[Dict]:
+    """
+    Convert k-way rankings to multiple pairwise comparisons
+    This can use TRL's standard DPOTrainer directly!
+    """
+    pairwise_data = []
+    
+    for item in data:
+        ranking = item['ranking']
+        candidates = item['candidates']
+        prompt = item['prompt']
+        
+        # Create pairs: best vs each worse candidate
+        best_idx = ranking[0]
+        
+        for i in range(1, len(ranking)):
+            worse_idx = ranking[i]
+            
+            pairwise_data.append({
+                "prompt": prompt,
+                "chosen": [{"role": "assistant", "content": candidates[best_idx]}],
+                "rejected": [{"role": "assistant", "content": candidates[worse_idx]}]
+            })
+    
+    return pairwise_data
+
+# ============================================================================
+# PART 6: TRAINING SCRIPTS
+# ============================================================================
+
+# OPTION 1: Use TRL with Pairwise Conversion (EASIEST)
+def train_with_trl_pairwise():
+    """Use standard TRL DPOTrainer with pairwise data"""
+    
+    # Load models
+    model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen2.5-4B-Instruct",
+        torch_dtype=torch.bfloat16,
+        device_map="auto"
+    )
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen2.5-4B-Instruct",
+        torch_dtype=torch.bfloat16,
+        device_map="auto"
+    )
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-4B-Instruct")
+    
+    # Load and convert data
+    raw_data = prepare_dataset("sql_rankings.jsonl")
+    pairwise_data = convert_to_pairwise_dpo(raw_data)
+    
+    from datasets import Dataset
+    train_dataset = Dataset.from_list(pairwise_data)
+    
+    # Configure training
+    training_args = DPOConfig(
+        output_dir="./sql-dpo-pairwise",
+        num_train_epochs=1,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=8,
+        learning_rate=5e-7,
+        bf16=True,
+        logging_steps=10,
+        save_steps=100,
+        beta=0.1,  # DPO temperature
+        max_length=2048,
+        max_prompt_length=1024,
+    )
+    
+    # Train
+    trainer = DPOTrainer(
+        model=model,
+        ref_model=ref_model,
+        args=training_args,
+        train_dataset=train_dataset,
+        tokenizer=tokenizer,
+    )
+    
+    trainer.train()
+    model.save_pretrained("./sql-dpo-final")
+    
+    print("Training complete!")
+
+# OPTION 2: Custom Plackett-Luce Trainer
+def train_with_custom_pl():
+    """Use custom Plackett-Luce trainer"""
+    
+    # Load models
+    model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen2.5-4B-Instruct",
+        torch_dtype=torch.bfloat16,
+        device_map="auto"
+    )
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen2.5-4B-Instruct",
+        torch_dtype=torch.bfloat16,
+        device_map="auto"
+    )
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-4B-Instruct")
+    
+    # Load data
+    raw_data = prepare_dataset("sql_rankings.jsonl")
+    train_dataset = PlackettLuceDataset(raw_data, tokenizer)
+    
+    # Configure training
+    training_args = TrainingArguments(
+        output_dir="./sql-plpo",
+        num_train_epochs=1,
+        per_device_train_batch_size=1,  # Low due to K candidates
+        gradient_accumulation_steps=16,
+        learning_rate=5e-7,
+        bf16=True,
+        logging_steps=10,
+        save_steps=100,
+    )
+    
+    # Train
+    trainer = PlackettLuceDPOTrainer(
+        model=model,
+        ref_model=ref_model,
+        args=training_args,
+        train_dataset=train_dataset,
+        beta=0.1
+    )
+    
+    trainer.train()
+    model.save_pretrained("./sql-plpo-final")
+    
+    print("Plackett-Luce training complete!")
+
+# OPTION 3: Using Unsloth (Fastest)
+def train_with_unsloth():
+    """
+    Use Unsloth for faster training
+    Unsloth supports standard DPO, so use pairwise conversion
+    """
+    
+    from unsloth import FastLanguageModel
+    from trl import DPOTrainer, DPOConfig
+    
+    # Load with Unsloth (4x faster)
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name="Qwen/Qwen2.5-4B-Instruct",
+        max_seq_length=2048,
+        load_in_4bit=True,  # Use 4-bit quantization
+    )
+    
+    # Add LoRA adapters
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        use_rslora=True,
+    )
+    
+    # Prepare data (pairwise)
+    raw_data = prepare_dataset("sql_rankings.jsonl")
+    pairwise_data = convert_to_pairwise_dpo(raw_data)
+    
+    from datasets import Dataset
+    train_dataset = Dataset.from_list(pairwise_data)
+    
+    # Train with DPO
+    trainer = DPOTrainer(
+        model=model,
+        ref_model=None,  # Unsloth handles this internally
+        args=DPOConfig(
+            output_dir="./sql-dpo-unsloth",
+            per_device_train_batch_size=4,
+            num_train_epochs=1,
+            learning_rate=5e-5,
+            bf16=True,
+        ),
+        train_dataset=train_dataset,
+        tokenizer=tokenizer,
+    )
+    
+    trainer.train()
+    
+    print("Unsloth training complete!")
+
+if __name__ == "__main__":
+    print("Choose training method:")
+    print("1. TRL with Pairwise (Recommended - Easiest)")
+    print("2. Custom Plackett-Luce (Full k-way ranking)")
+    print("3. Unsloth with Pairwise (Fastest)")
+    
+    # Run option 1 by default
+    train_with_trl_pairwise()
