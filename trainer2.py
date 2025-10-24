@@ -8,20 +8,16 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Union
 import gc
 
-def pl_data_collator(features: List[Dict]) -> Dict[str, List]:
-    """
-    Keep examples as python lists (ragged). We do padding/tensorization later.
-    """
-    out = {}
-    keys = features[0].keys()
-    for k in keys:
-        out[k] = [f[k] for f in features]
-    return out
 
-
-def compute_plackett_luce_logprob(scores: torch.Tensor):
+def compute_plackett_luce_logprob(scores):
     """
-    scores: [k] tensor (best → worst), returns scalar tensor (log-prob)
+    Compute log probability of a ranking under Plackett-Luce model.
+
+    Args:
+        scores: [k] tensor - scores for items in ranked order (best to worst)
+
+    Returns:
+        log_prob: scalar - log probability of this ranking
     """
     k = scores.shape[0]
     log_prob = scores.new_zeros(())  # tensor scalar on same device/dtype
@@ -32,7 +28,15 @@ def compute_plackett_luce_logprob(scores: torch.Tensor):
         log_prob = log_prob + (scores[i] - logsumexp)
     return log_prob
 
-
+def pl_data_collator(features: List[Dict]) -> Dict[str, List]:
+    """
+    Keep examples as python lists (ragged). We do padding/tensorization later.
+    """
+    out = {}
+    keys = features[0].keys()
+    for k in keys:
+        out[k] = [f[k] for f in features]
+    return out
 
 def get_ranking_from_q_and_genorder(q_values, generation_order):
     """
@@ -58,6 +62,26 @@ def get_ranking_from_q_and_genorder(q_values, generation_order):
     ranking_indices = torch.argsort(composite_scores, descending=True)
 
     return ranking_indices.tolist()
+
+
+class MemoryCleanupCallback(TrainerCallback):
+    """
+    Aggressive memory cleanup callback.
+    Clears CUDA cache every N steps.
+    """
+
+    def __init__(self, cleanup_every_n_steps: int = 10):
+        self.cleanup_every_n_steps = cleanup_every_n_steps
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.cleanup_every_n_steps == 0:
+            torch.cuda.empty_cache()
+            gc.collect()
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        # Clean up after evaluation
+        torch.cuda.empty_cache()
+        gc.collect()
 
 
 class PlackettLuceDPOTrainer(DPOTrainer):
@@ -334,21 +358,21 @@ def train_plackett_luce_dpo(
         eval_data: Optional[List[Dict]] = None,
         output_dir: str = "./pl_dpo_output",
         num_epochs: int = 3,
+        max_steps: Optional[int] = None,
         learning_rate: float = 5e-5,
         beta: float = 0.1,
         per_device_train_batch_size: int = 1,
         gradient_accumulation_steps: int = 4,
         eval_steps: int = 500,
-        save_steps: int = 500,
+        save_strategy: str = "epoch",
         logging_steps: int = 10,
         warmup_steps: int = 100,
         max_length: int = 512,
         lora_r: int = 16,
         lora_alpha: int = 32,
         lora_dropout: float = 0.05,
-        use_wandb: bool = True,
-        wandb_project: str = "plackett-luce-dpo",
         gradient_checkpointing: bool = True,
+        memory_cleanup_steps: int = 10,
 ):
     """
     Train Plackett-Luce DPO with LoRA.
@@ -359,23 +383,22 @@ def train_plackett_luce_dpo(
         eval_data: Optional list of evaluation samples
         output_dir: Output directory
         num_epochs: Number of training epochs
+        max_steps: Maximum number of training steps (overrides num_epochs if set)
         learning_rate: Learning rate
         beta: DPO beta parameter
         per_device_train_batch_size: Batch size per device
         gradient_accumulation_steps: Gradient accumulation steps
         eval_steps: Evaluate every N steps
-        save_steps: Save checkpoint every N steps
+        save_strategy: Save strategy ("epoch" or "steps")
         logging_steps: Log metrics every N steps
         warmup_steps: Warmup steps
         max_length: Max sequence length
         lora_r: LoRA rank
         lora_alpha: LoRA alpha
         lora_dropout: LoRA dropout
-        use_wandb: Whether to use Weights & Biases
-        wandb_project: W&B project name
         gradient_checkpointing: Use gradient checkpointing
+        memory_cleanup_steps: Clean CUDA cache every N steps
     """
-
 
     # Load tokenizer
     print(f"Loading tokenizer from {model_name}...")
@@ -427,22 +450,29 @@ def train_plackett_luce_dpo(
     training_args = DPOConfig(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
+        max_steps=max_steps if max_steps else -1,
         per_device_train_batch_size=per_device_train_batch_size,
         per_device_eval_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
         logging_steps=logging_steps,
-        save_steps=save_steps,
-        eval_steps=eval_steps,
+        save_strategy=save_strategy,
+        evaluation_strategy="steps" if eval_dataset else "no",
+        eval_steps=eval_steps if eval_dataset else None,
         warmup_steps=warmup_steps,
         bf16=True,
         gradient_checkpointing=gradient_checkpointing,
-        report_to="wandb" if use_wandb else "none",
+        report_to="none",
         remove_unused_columns=False,
         beta=beta,
         max_length=max_length,
         max_prompt_length=max_length // 2,
+        load_best_model_at_end=False,
+        save_total_limit=3,  # Keep only last 3 checkpoints
     )
+
+    # Initialize memory cleanup callback
+    memory_callback = MemoryCleanupCallback(cleanup_every_n_steps=memory_cleanup_steps)
 
     # Initialize trainer
     print("Initializing trainer...")
@@ -453,16 +483,32 @@ def train_plackett_luce_dpo(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
-        data_collator=pl_data_collator
+        callbacks=[memory_callback],
+        data_collator=pl_data_collator,   # ← add this
+
     )
 
     # Train
     print("Starting training...")
+    print(f"Total training samples: {len(train_dataset)}")
+    if eval_dataset:
+        print(f"Total eval samples: {len(eval_dataset)}")
+    print(f"Effective batch size: {per_device_train_batch_size * gradient_accumulation_steps}")
+    if max_steps:
+        print(f"Max steps: {max_steps}")
+    else:
+        print(f"Epochs: {num_epochs}")
+    print("=" * 60)
+
     trainer.train()
 
     # Save final model
     print(f"Saving final model to {output_dir}/final")
     trainer.save_model(f"{output_dir}/final")
+
+    # Clean up
+    torch.cuda.empty_cache()
+    gc.collect()
 
     return model, tokenizer
 
@@ -499,15 +545,16 @@ if __name__ == "__main__":
         eval_data=eval_data,
         output_dir="./pl_dpo_lora",
         num_epochs=3,
+        max_steps=None,  # Set to a number to limit total steps
         learning_rate=5e-5,
         beta=0.1,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         eval_steps=500,
-        save_steps=500,
+        save_strategy="epoch",  # or "steps"
         logging_steps=10,
         lora_r=16,
         lora_alpha=32,
-        use_wandb=True,
         gradient_checkpointing=True,
+        memory_cleanup_steps=10,  # Clean CUDA cache every 10 steps
     )
