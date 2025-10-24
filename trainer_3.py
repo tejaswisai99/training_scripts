@@ -182,13 +182,19 @@ class MemoryCleanupCallback(TrainerCallback):
     Aggressive memory cleanup callback.
     Clears CUDA cache every N steps.
     """
-    def __init__(self, cleanup_every_n_steps: int = 10):
+    def __init__(self, cleanup_every_n_steps: int = 5):
         self.cleanup_every_n_steps = cleanup_every_n_steps
     
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step % self.cleanup_every_n_steps == 0:
             torch.cuda.empty_cache()
             gc.collect()
+            
+            # Print memory stats for debugging
+            if torch.cuda.is_available() and state.global_step % (self.cleanup_every_n_steps * 2) == 0:
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"\n[Step {state.global_step}] GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
     
     def on_evaluate(self, args, state, control, **kwargs):
         torch.cuda.empty_cache()
@@ -478,10 +484,18 @@ def train_plackett_luce_dpo(
     lora_alpha: int = 32,
     lora_dropout: float = 0.05,
     gradient_checkpointing: bool = True,
-    memory_cleanup_steps: int = 10,
+    memory_cleanup_steps: int = 5,
+    load_in_8bit: bool = False,
 ):
     """
     Train Plackett-Luce DPO with LoRA.
+    
+    Memory optimization tips:
+    - Reduce max_length (e.g., 256 or 384 instead of 512)
+    - Enable load_in_8bit=True for quantization
+    - Reduce per_device_train_batch_size to 1
+    - Increase gradient_accumulation_steps
+    - Reduce lora_r (e.g., 8 instead of 16)
     """
     
     # Load tokenizer
@@ -490,17 +504,24 @@ def train_plackett_luce_dpo(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load models WITHOUT device_map (let Trainer/Accelerate handle it)
+    # Load models with optional 8-bit quantization
     print(f"Loading model from {model_name}...")
+    model_kwargs = {
+        "torch_dtype": torch.bfloat16,
+    }
+    if load_in_8bit:
+        model_kwargs["load_in_8bit"] = True
+        print("Loading model in 8-bit mode for memory efficiency...")
+    
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
+        **model_kwargs
     )
     
     print("Loading reference model...")
     ref_model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
+        **model_kwargs
     )
     
     # Apply LoRA to policy model
@@ -514,8 +535,12 @@ def train_plackett_luce_dpo(
         task_type="CAUSAL_LM",
     )
     
-    if gradient_checkpointing:
+    if gradient_checkpointing and not load_in_8bit:
         model.gradient_checkpointing_enable()
+    
+    if load_in_8bit:
+        from peft import prepare_model_for_kbit_training
+        model = prepare_model_for_kbit_training(model)
     
     model = get_peft_model(model, lora_config)
     print("\nTrainable parameters:")
@@ -549,12 +574,14 @@ def train_plackett_luce_dpo(
         eval_steps=eval_steps if eval_dataset else None,
         warmup_steps=warmup_steps,
         bf16=True,
-        gradient_checkpointing=gradient_checkpointing,
+        gradient_checkpointing=gradient_checkpointing and not load_in_8bit,
         report_to="none",
         remove_unused_columns=False,
-        save_total_limit=3,
+        save_total_limit=2,  # Keep only 2 checkpoints to save disk
         label_names=["labels"],
         logging_first_step=True,
+        dataloader_pin_memory=False,  # Disable pin memory to save RAM
+        max_grad_norm=1.0,  # Gradient clipping
     )
     
     # Initialize callbacks
@@ -586,6 +613,9 @@ def train_plackett_luce_dpo(
     else:
         print(f"Epochs: {num_epochs}")
     print(f"Beta: {beta}")
+    print(f"Max sequence length: {max_length}")
+    print(f"LoRA rank: {lora_r}")
+    print(f"8-bit quantization: {load_in_8bit}")
     print(f"Save model + tokenizer every {save_steps} steps")
     print("=" * 60)
     
