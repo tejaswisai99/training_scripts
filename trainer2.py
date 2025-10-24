@@ -516,27 +516,8 @@ def train_plackett_luce_dpo(
 # Example usage
 if __name__ == "__main__":
     # Example training data
-    train_data = [
-        {
-            "messages": [
-                {"role": "system", "content": "you are an expert historian"},
-                {"role": "user", "content": "who is the father of the nation for India?"}
-            ],
-            "candidates": [
-                {"role": "assistant", "content": "Mahatma Gandhi"},
-                {"role": "assistant", "content": "Sachin Tendulkar"},
-                {"role": "assistant", "content": "Narendra Modi"},
-                {"role": "assistant", "content": "Donald Trump"}
-            ],
-            "q_values": [0.85, 0.3, 0.0, 0.0],
-            "generation_order": [0, 1, 2, 3]
-        },
-        # Add more samples...
-    ]
+    train_data, eval_data = load_and_split_jsonl(data_path, split_ratio=0.9)
 
-    eval_data = [
-        # Similar format for evaluation
-    ]
 
     # Train
     model, tokenizer = train_plackett_luce_dpo(
@@ -558,3 +539,21 @@ if __name__ == "__main__":
         gradient_checkpointing=True,
         memory_cleanup_steps=10,  # Clean CUDA cache every 10 steps
     )
+
+
+def load_and_split_jsonl(path: str, split_ratio: float = 0.9, seed: int = 42):
+    """
+    Load a JSONL file and split into train/eval lists.
+    Each line: {"messages": [...], "candidates": [...], "q_values": [...], "generation_order": [...]}
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = [json.loads(line) for line in f if line.strip()]
+
+    random.Random(seed).shuffle(data)
+    n_train = int(len(data) * split_ratio)
+
+    train_data = data[:n_train]
+    eval_data = data[n_train:]
+
+    print(f"Loaded {len(data)} samples → train={len(train_data)}, eval={len(eval_data)}")
+    return train_data, eval_data
