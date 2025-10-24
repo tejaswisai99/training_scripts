@@ -8,30 +8,30 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Union
 import gc
 
-
-def compute_plackett_luce_logprob(scores):
+def pl_data_collator(features: List[Dict]) -> Dict[str, List]:
     """
-    Compute log probability of a ranking under Plackett-Luce model.
-
-    Args:
-        scores: [k] tensor - scores for items in ranked order (best to worst)
-
-    Returns:
-        log_prob: scalar - log probability of this ranking
+    Keep examples as python lists (ragged). We do padding/tensorization later.
     """
-    k = len(scores)
-    log_prob = 0.0
+    out = {}
+    keys = features[0].keys()
+    for k in keys:
+        out[k] = [f[k] for f in features]
+    return out
 
+
+def compute_plackett_luce_logprob(scores: torch.Tensor):
+    """
+    scores: [k] tensor (best → worst), returns scalar tensor (log-prob)
+    """
+    k = scores.shape[0]
+    log_prob = scores.new_zeros(())  # tensor scalar on same device/dtype
     for i in range(k - 1):
         remaining_scores = scores[i:]
-
-        # Logsumexp for numerical stability
-        max_score = torch.max(remaining_scores)
-        logsumexp = max_score + torch.log(torch.sum(torch.exp(remaining_scores - max_score)))
-
-        log_prob = log_prob + scores[i] - logsumexp
-
+        max_score = remaining_scores.max()
+        logsumexp = max_score + torch.log(torch.exp(remaining_scores - max_score).sum())
+        log_prob = log_prob + (scores[i] - logsumexp)
     return log_prob
+
 
 
 def get_ranking_from_q_and_genorder(q_values, generation_order):
@@ -124,12 +124,7 @@ class PlackettLuceDPOTrainer(DPOTrainer):
             self, model: torch.nn.Module, batch: Dict[str, Union[List, torch.LongTensor]]
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """
-        Run forward pass for all k candidates and compute per-candidate log probs.
-
-        Returns:
-            policy_logprobs: [batch_size, k] - log probs from policy model
-            reference_logprobs: [batch_size, k] - log probs from reference model
-            (empty tensors for other returns to match parent signature)
+        Forward all candidates, return [B, K_max] tensors; padded slots are -inf.
         """
         concatenated_batch = self.concatenated_inputs(
             batch,
@@ -139,62 +134,67 @@ class PlackettLuceDPOTrainer(DPOTrainer):
             device=self.accelerator.device,
         )
 
-        len_candidates = batch.get("num_candidates", [4])[0]  # k value
-        batch_size = len(batch["input_ids"])
+        # counts of candidates per sample (variable k)
+        counts = [len(cands) for cands in batch["input_ids"]]
+        B = len(counts)
+        K_max = max(counts)
 
-        # Forward pass through model
+        # policy forward
         outputs = model(
             input_ids=concatenated_batch["input_ids"],
             attention_mask=concatenated_batch["attention_mask"],
         )
-
         logits = outputs.logits
         labels = concatenated_batch["labels"]
 
-        # Compute per-token log probs
-        # Shift for next-token prediction
+        # shift for next-token prediction
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
 
         log_probs = F.log_softmax(shift_logits, dim=-1)
 
-        # Gather log probs of actual tokens
-        per_token_logps = torch.gather(
-            log_probs,
-            dim=2,
-            index=shift_labels.unsqueeze(2)
-        ).squeeze(2)
+        # mask BEFORE gather; set dummy index for masked positions
+        loss_mask = (shift_labels != self.label_pad_token_id)
+        gather_index = shift_labels.clone()
+        gather_index[~loss_mask] = 0  # safe dummy index
 
-        # Mask padding tokens
-        loss_mask = (shift_labels != self.label_pad_token_id).float()
-        per_token_logps = per_token_logps * loss_mask
+        per_token_logps = torch.gather(log_probs, dim=2, index=gather_index.unsqueeze(2)).squeeze(2)
+        per_token_logps = per_token_logps * loss_mask.float()
+        sequence_logps = per_token_logps.sum(dim=1)  # [sum_k]
 
-        # Sum across sequence length
-        sequence_logps = per_token_logps.sum(dim=1)  # [batch_size * k]
+        # split back per sample and left-pad with -inf to K_max
+        split_policy = list(torch.split(sequence_logps, counts))
+        pad_fill = torch.finfo(sequence_logps.dtype).min  # ~ -inf
+        policy_list = []
+        for s in split_policy:
+            if s.numel() < K_max:
+                pad = s.new_full((K_max - s.numel(),), pad_fill)
+                s = torch.cat([s, pad], dim=0)
+            policy_list.append(s)
+        policy_logprobs = torch.stack(policy_list, dim=0)  # [B, K_max]
 
-        # Reshape to [batch_size, k]
-        policy_logprobs = sequence_logps.view(batch_size, len_candidates)
-
-        # Reference model forward pass
+        # reference forward (eval/no-grad)
         with torch.no_grad():
             ref_outputs = self.ref_model(
                 input_ids=concatenated_batch["input_ids"],
                 attention_mask=concatenated_batch["attention_mask"],
             )
-
             ref_logits = ref_outputs.logits
             ref_shift_logits = ref_logits[:, :-1, :].contiguous()
-
             ref_log_probs = F.log_softmax(ref_shift_logits, dim=-1)
-            ref_per_token_logps = torch.gather(
-                ref_log_probs,
-                dim=2,
-                index=shift_labels.unsqueeze(2)
-            ).squeeze(2)
 
-            ref_per_token_logps = ref_per_token_logps * loss_mask
+            ref_per_token_logps = torch.gather(ref_log_probs, dim=2, index=gather_index.unsqueeze(2)).squeeze(2)
+            ref_per_token_logps = ref_per_token_logps * loss_mask.float()
             ref_sequence_logps = ref_per_token_logps.sum(dim=1)
-            reference_logprobs = ref_sequence_logps.view(batch_size, len_candidates)
+
+            split_ref = list(torch.split(ref_sequence_logps, counts))
+            ref_list = []
+            for s in split_ref:
+                if s.numel() < K_max:
+                    pad = s.new_full((K_max - s.numel(),), pad_fill)
+                    s = torch.cat([s, pad], dim=0)
+                ref_list.append(s)
+            reference_logprobs = torch.stack(ref_list, dim=0)  # [B, K_max]
 
         return policy_logprobs, reference_logprobs, None, None
 
@@ -301,8 +301,8 @@ def prepare_dataset_for_training(data_list: List[Dict], tokenizer) -> Dataset:
             )
 
             # Tokenize
-            full_encoded = tokenizer(text, add_special_tokens=True)
-            prompt_encoded = tokenizer(prompt_text, add_special_tokens=True)
+            full_encoded = tokenizer(text, add_special_tokens=True, max_length=2048)
+            prompt_encoded = tokenizer(prompt_text, add_special_tokens=True, max_length=2048)
 
             input_ids = full_encoded["input_ids"]
             attention_mask = full_encoded["attention_mask"]
@@ -376,9 +376,6 @@ def train_plackett_luce_dpo(
         gradient_checkpointing: Use gradient checkpointing
     """
 
-    # Initialize wandb
-    if use_wandb:
-        wandb.init(project=wandb_project, name=f"pl_dpo_{model_name.split('/')[-1]}")
 
     # Load tokenizer
     print(f"Loading tokenizer from {model_name}...")
@@ -401,6 +398,8 @@ def train_plackett_luce_dpo(
         torch_dtype=torch.bfloat16,
         device_map="auto",
     )
+    ref_model.eval()
+    ref_model.requires_grad_(False)
 
     # Apply LoRA to policy model
     print("Applying LoRA...")
@@ -454,6 +453,7 @@ def train_plackett_luce_dpo(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
+        data_collator=pl_data_collator
     )
 
     # Train
