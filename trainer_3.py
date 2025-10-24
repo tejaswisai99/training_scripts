@@ -195,6 +195,77 @@ class MemoryCleanupCallback(TrainerCallback):
         gc.collect()
 
 
+class SaveWithTokenizerCallback(TrainerCallback):
+    """
+    Save model with tokenizer at specified intervals.
+    """
+    def __init__(self, tokenizer, save_steps: int = 1000):
+        self.tokenizer = tokenizer
+        self.save_steps = save_steps
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.save_steps == 0 and state.global_step > 0:
+            output_dir = f"{args.output_dir}/checkpoint-{state.global_step}"
+            print(f"\nSaving model and tokenizer to {output_dir}")
+            
+            # Save model (trainer will handle this)
+            control.should_save = True
+            
+            # Save tokenizer explicitly
+            self.tokenizer.save_pretrained(output_dir)
+    
+    def on_save(self, args, state, control, **kwargs):
+        # Also save tokenizer whenever model is saved
+        output_dir = f"{args.output_dir}/checkpoint-{state.global_step}"
+        self.tokenizer.save_pretrained(output_dir)
+
+
+class CumulativeMetricsCallback(TrainerCallback):
+    """
+    Track cumulative metrics and add them to trainer_state.json.
+    """
+    def __init__(self):
+        self.cumulative_metrics = {
+            'total_loss': 0.0,
+            'total_rewards_accuracy': 0.0,
+            'total_rewards_margin': 0.0,
+            'total_logps_margin': 0.0,
+            'num_batches': 0,
+        }
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Update cumulative metrics from logs."""
+        if logs is not None:
+            # Update cumulative metrics
+            if 'loss' in logs:
+                self.cumulative_metrics['total_loss'] += logs['loss']
+                self.cumulative_metrics['num_batches'] += 1
+            
+            if 'rewards/accuracy' in logs:
+                self.cumulative_metrics['total_rewards_accuracy'] += logs['rewards/accuracy']
+            
+            if 'rewards/margin' in logs:
+                self.cumulative_metrics['total_rewards_margin'] += logs['rewards/margin']
+            
+            if 'logps/margin' in logs:
+                self.cumulative_metrics['total_logps_margin'] += logs['logps/margin']
+            
+            # Compute averages
+            n = self.cumulative_metrics['num_batches']
+            if n > 0:
+                cumulative_avg = {
+                    'cumulative/avg_loss': self.cumulative_metrics['total_loss'] / n,
+                    'cumulative/avg_rewards_accuracy': self.cumulative_metrics['total_rewards_accuracy'] / n,
+                    'cumulative/avg_rewards_margin': self.cumulative_metrics['total_rewards_margin'] / n,
+                    'cumulative/avg_logps_margin': self.cumulative_metrics['total_logps_margin'] / n,
+                    'cumulative/num_batches': n,
+                }
+                
+                # Add to state's log_history (will be saved in trainer_state.json)
+                if state.log_history:
+                    state.log_history[-1].update(cumulative_avg)
+
+
 class PlackettLuceDPOTrainer(Trainer):
     """
     Trainer for Plackett-Luce DPO with k > 2 candidates.
@@ -398,7 +469,8 @@ def train_plackett_luce_dpo(
     per_device_train_batch_size: int = 1,
     gradient_accumulation_steps: int = 4,
     eval_steps: int = 500,
-    save_strategy: str = "epoch",
+    save_strategy: str = "steps",
+    save_steps: int = 1000,
     logging_steps: int = 10,
     warmup_steps: int = 100,
     max_length: int = 512,
@@ -472,6 +544,7 @@ def train_plackett_luce_dpo(
         learning_rate=learning_rate,
         logging_steps=logging_steps,
         save_strategy=save_strategy,
+        save_steps=save_steps,
         evaluation_strategy="steps" if eval_dataset else "no",
         eval_steps=eval_steps if eval_dataset else None,
         warmup_steps=warmup_steps,
@@ -481,10 +554,13 @@ def train_plackett_luce_dpo(
         remove_unused_columns=False,
         save_total_limit=3,
         label_names=["labels"],
+        logging_first_step=True,
     )
     
-    # Initialize memory cleanup callback
+    # Initialize callbacks
     memory_callback = MemoryCleanupCallback(cleanup_every_n_steps=memory_cleanup_steps)
+    save_tokenizer_callback = SaveWithTokenizerCallback(tokenizer=tokenizer, save_steps=save_steps)
+    cumulative_metrics_callback = CumulativeMetricsCallback()
     
     # Initialize trainer
     print("\nInitializing trainer...")
@@ -496,7 +572,7 @@ def train_plackett_luce_dpo(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        callbacks=[memory_callback],
+        callbacks=[memory_callback, save_tokenizer_callback, cumulative_metrics_callback],
     )
     
     # Train
@@ -510,13 +586,15 @@ def train_plackett_luce_dpo(
     else:
         print(f"Epochs: {num_epochs}")
     print(f"Beta: {beta}")
+    print(f"Save model + tokenizer every {save_steps} steps")
     print("=" * 60)
     
     trainer.train()
     
-    # Save final model
+    # Save final model and tokenizer
     print(f"\nSaving final model to {output_dir}/final")
     trainer.save_model(f"{output_dir}/final")
+    tokenizer.save_pretrained(f"{output_dir}/final")
     
     # Clean up
     torch.cuda.empty_cache()
@@ -561,7 +639,8 @@ if __name__ == "__main__":
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         eval_steps=500,
-        save_strategy="epoch",
+        save_strategy="steps",  # Save by steps
+        save_steps=1000,  # Save every 1000 steps
         logging_steps=10,
         lora_r=16,
         lora_alpha=32,
