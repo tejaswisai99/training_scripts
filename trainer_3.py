@@ -298,98 +298,89 @@ class PlackettLuceDPOTrainer(Trainer):
         if hasattr(self.model, 'device'):
             self.ref_model = self.ref_model.to(self.model.device)
     
-    def compute_loss(self, model, inputs, return_outputs=False):
+        def compute_loss(self, model, inputs, return_outputs=False):
         """
         Compute Plackett-Luce DPO loss.
         Handles variable k across batch samples.
         """
-        # Extract batch info
         batch_size = inputs["batch_size"]
         num_candidates_list = inputs["num_candidates"]
-        
-        # Forward pass through policy model
+
+        # --- Forward policy ---
         outputs = model(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
         )
-        
         policy_logits = outputs.logits
-        
-        # Forward pass through reference model
+
+        # --- Forward reference (no grad) ---
         with torch.no_grad():
             ref_outputs = self.ref_model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
             )
             ref_logits = ref_outputs.logits
-        
-        # Compute sequence log probabilities for ALL candidates (flattened)
-        policy_sequence_logps = compute_sequence_logprobs(
-            policy_logits, 
-            inputs["labels"],
-            self.args.label_pad_token_id if hasattr(self.args, 'label_pad_token_id') else -100
+
+        # --- Sequence log-probs ---
+        pad_id = (
+            self.args.label_pad_token_id
+            if hasattr(self.args, "label_pad_token_id")
+            else -100
         )
-        
-        ref_sequence_logps = compute_sequence_logprobs(
-            ref_logits,
-            inputs["labels"],
-            self.args.label_pad_token_id if hasattr(self.args, 'label_pad_token_id') else -100
-        )
-        
-        # Split logprobs by sample (handle variable k)
-        losses = []
-        all_metrics = {
-            'logprobs_policy_ranking': [],
-            'logprobs_ref_ranking': [],
-            'logprobs_margin': [],
-            'rewards_margin': [],
-            'rewards_accuracy': [],
-        }
-        
+        policy_seq_logps = compute_sequence_logprobs(policy_logits, inputs["labels"], pad_id)
+        ref_seq_logps = compute_sequence_logprobs(ref_logits, inputs["labels"], pad_id)
+
+        # --- Per-example loop ---
+        total_loss = policy_seq_logps.new_zeros(())  # tensor scalar, keeps grad
+        metrics = {}
+
         offset = 0
         for i in range(batch_size):
             k = num_candidates_list[i]
-            
-            # Extract logprobs for this sample's k candidates
-            policy_logps = policy_sequence_logps[offset:offset+k]
-            ref_logps = ref_sequence_logps[offset:offset+k]
+
+            # Slice this example's candidates
+            pol = policy_seq_logps[offset : offset + k]
+            ref = ref_seq_logps[offset : offset + k]
             offset += k
-            
-            # Get ranking for this sample
-            q_values = inputs["q_values"][i]
-            generation_order = inputs["generation_order"][i]
-            
-            ranking_indices = get_ranking_from_q_and_genorder(q_values, generation_order)
-            ranking_indices_tensor = torch.tensor(ranking_indices, device=policy_logps.device)
-            
-            # Reorder logprobs according to ranking
-            policy_scores_ranked = policy_logps[ranking_indices_tensor]
-            ref_scores_ranked = ref_logps[ranking_indices_tensor]
-            
-            # Compute Plackett-Luce log probabilities
-            log_p_policy = compute_plackett_luce_logprob(policy_scores_ranked)
-            log_p_ref = compute_plackett_luce_logprob(ref_scores_ranked)
-            
-            # DPO loss
-            logits = self.beta * (log_p_policy - log_p_ref)
-            loss = -F.logsigmoid(logits)
-            
-            losses.append(loss)
-            
-            # Collect metrics
-            all_metrics['logprobs_policy_ranking'].append(log_p_policy.item())
-            all_metrics['logprobs_ref_ranking'].append(log_p_ref.item())
-            all_metrics['logprobs_margin'].append((log_p_policy - log_p_ref).item())
-            all_metrics['rewards_margin'].append(logits.item())
-            all_metrics['rewards_accuracy'].append((logits > 0).float().item())
-        
-        # Average loss
-        loss = torch.stack(losses).mean()
-        
-        # Log averaged metrics
-        for key, values in all_metrics.items():
-            self.log({key: sum(values) / len(values)})
-        
+
+            q_vals = inputs["q_values"][i]
+            gen_order = inputs["generation_order"][i]
+            ranking = get_ranking_from_q_and_genorder(q_vals, gen_order)
+            r_idx = torch.tensor(ranking, device=pol.device, dtype=torch.long)
+
+            pol_ranked = pol.index_select(0, r_idx)
+            ref_ranked = ref.index_select(0, r_idx).detach()  # stop grad on ref
+
+            # Plackett–Luce log-likelihoods
+            logP_pol = compute_plackett_luce_logprob(pol_ranked)
+            logP_ref = compute_plackett_luce_logprob(ref_ranked)
+
+            margin = self.beta * (logP_pol - logP_ref)
+            loss_i = -F.logsigmoid(margin)  # differentiable
+            total_loss = total_loss + loss_i
+
+            # --- Metrics (detach for logging only) ---
+            if i == 0:  # log first example to avoid flooding
+                metrics = {
+                    "logprobs_policy_ranking": logP_pol.detach().float(),
+                    "logprobs_ref_ranking": logP_ref.detach().float(),
+                    "logprobs_margin": (logP_pol - logP_ref).detach().float(),
+                    "rewards_margin": margin.detach().float(),
+                    "rewards_accuracy": (margin.detach() > 0).float(),
+                }
+
+        # --- Mean loss ---
+        loss = total_loss / batch_size
+
+        # Defensive check
+        if not loss.requires_grad:
+            raise RuntimeError("Loss tensor detached — check detach/item usage above.")
+
+        # --- Logging ---
+        if metrics:
+            safe = {k: (v.item() if torch.is_tensor(v) else v) for k, v in metrics.items()}
+            self.log(safe)
+
         return (loss, outputs) if return_outputs else loss
 
 
