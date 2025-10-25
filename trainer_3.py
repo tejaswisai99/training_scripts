@@ -451,17 +451,30 @@ def prepare_dataset_for_training(data_list: List[Dict], tokenizer, max_length: i
                 add_generation_prompt=True
             )
             
-            # Tokenize
-            full_encoded = tokenizer(text, add_special_tokens=True)
-            prompt_encoded = tokenizer(prompt_text, add_special_tokens=True)
+            # Tokenize WITHOUT truncation first
+            full_encoded = tokenizer(text, add_special_tokens=True, truncation=False)
+            prompt_encoded = tokenizer(prompt_text, add_special_tokens=True, truncation=False)
             
             input_ids = full_encoded["input_ids"]
             attention_mask = full_encoded["attention_mask"]
+            prompt_len = len(prompt_encoded["input_ids"])
             
             # Create labels: -100 for prompt tokens
             labels = input_ids.copy()
-            prompt_len = len(prompt_encoded["input_ids"])
             labels[:prompt_len] = [-100] * prompt_len
+            
+            # NOW truncate if needed - from LEFT to preserve response
+            if len(input_ids) > max_length:
+                # Calculate how much to remove
+                overflow = len(input_ids) - max_length
+                
+                # Truncate from left (remove from prompt, keep response)
+                input_ids = input_ids[overflow:]
+                attention_mask = attention_mask[overflow:]
+                labels = labels[overflow:]
+                
+                # Note: After truncation, some prompt tokens might remain at start
+                # Those will still be marked as -100, which is correct
             
             input_ids_list.append(input_ids)
             attention_mask_list.append(attention_mask)
