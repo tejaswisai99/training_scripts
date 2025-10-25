@@ -182,23 +182,31 @@ class MemoryCleanupCallback(TrainerCallback):
     Aggressive memory cleanup callback.
     Clears CUDA cache every N steps.
     """
-    def __init__(self, cleanup_every_n_steps: int = 5):
+    def __init__(self, cleanup_every_n_steps: int = 1):
         self.cleanup_every_n_steps = cleanup_every_n_steps
     
     def on_step_end(self, args, state, control, **kwargs):
+        # Clean after EVERY step for now
         if state.global_step % self.cleanup_every_n_steps == 0:
             torch.cuda.empty_cache()
             gc.collect()
             
-            # Print memory stats for debugging
-            if torch.cuda.is_available() and state.global_step % (self.cleanup_every_n_steps * 2) == 0:
+            # Print memory stats every 10 steps
+            if torch.cuda.is_available() and state.global_step % 10 == 0:
                 allocated = torch.cuda.memory_allocated() / 1024**3
                 reserved = torch.cuda.memory_reserved() / 1024**3
-                print(f"\n[Step {state.global_step}] GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+                max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+                print(f"\n[Step {state.global_step}] GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {max_allocated:.2f}GB peak")
+                # Reset peak stats
+                torch.cuda.reset_peak_memory_stats()
     
     def on_evaluate(self, args, state, control, **kwargs):
         torch.cuda.empty_cache()
         gc.collect()
+    
+    def on_log(self, args, state, control, **kwargs):
+        # Also clean on log to prevent accumulation
+        torch.cuda.empty_cache()
 
 
 class SaveWithTokenizerCallback(TrainerCallback):
@@ -298,89 +306,103 @@ class PlackettLuceDPOTrainer(Trainer):
         if hasattr(self.model, 'device'):
             self.ref_model = self.ref_model.to(self.model.device)
     
-        def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False):
         """
         Compute Plackett-Luce DPO loss.
         Handles variable k across batch samples.
         """
+        # Extract batch info
         batch_size = inputs["batch_size"]
         num_candidates_list = inputs["num_candidates"]
-
-        # --- Forward policy ---
+        
+        # Forward pass through policy model
         outputs = model(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
         )
+        
         policy_logits = outputs.logits
-
-        # --- Forward reference (no grad) ---
+        
+        # Forward pass through reference model
         with torch.no_grad():
             ref_outputs = self.ref_model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
             )
             ref_logits = ref_outputs.logits
-
-        # --- Sequence log-probs ---
-        pad_id = (
-            self.args.label_pad_token_id
-            if hasattr(self.args, "label_pad_token_id")
-            else -100
+        
+        # Compute sequence log probabilities for ALL candidates (flattened)
+        policy_sequence_logps = compute_sequence_logprobs(
+            policy_logits, 
+            inputs["labels"],
+            self.args.label_pad_token_id if hasattr(self.args, 'label_pad_token_id') else -100
         )
-        policy_seq_logps = compute_sequence_logprobs(policy_logits, inputs["labels"], pad_id)
-        ref_seq_logps = compute_sequence_logprobs(ref_logits, inputs["labels"], pad_id)
-
-        # --- Per-example loop ---
-        total_loss = policy_seq_logps.new_zeros(())  # tensor scalar, keeps grad
-        metrics = {}
-
+        
+        ref_sequence_logps = compute_sequence_logprobs(
+            ref_logits,
+            inputs["labels"],
+            self.args.label_pad_token_id if hasattr(self.args, 'label_pad_token_id') else -100
+        )
+        
+        # Split logprobs by sample (handle variable k)
+        losses = []
+        all_metrics = {
+            'logprobs_policy_ranking': [],
+            'logprobs_ref_ranking': [],
+            'logprobs_margin': [],
+            'rewards_margin': [],
+            'rewards_accuracy': [],
+        }
+        
         offset = 0
         for i in range(batch_size):
             k = num_candidates_list[i]
-
-            # Slice this example's candidates
-            pol = policy_seq_logps[offset : offset + k]
-            ref = ref_seq_logps[offset : offset + k]
+            
+            # Extract logprobs for this sample's k candidates
+            policy_logps = policy_sequence_logps[offset:offset+k]
+            ref_logps = ref_sequence_logps[offset:offset+k]
             offset += k
-
-            q_vals = inputs["q_values"][i]
-            gen_order = inputs["generation_order"][i]
-            ranking = get_ranking_from_q_and_genorder(q_vals, gen_order)
-            r_idx = torch.tensor(ranking, device=pol.device, dtype=torch.long)
-
-            pol_ranked = pol.index_select(0, r_idx)
-            ref_ranked = ref.index_select(0, r_idx).detach()  # stop grad on ref
-
-            # Plackett–Luce log-likelihoods
-            logP_pol = compute_plackett_luce_logprob(pol_ranked)
-            logP_ref = compute_plackett_luce_logprob(ref_ranked)
-
-            margin = self.beta * (logP_pol - logP_ref)
-            loss_i = -F.logsigmoid(margin)  # differentiable
-            total_loss = total_loss + loss_i
-
-            # --- Metrics (detach for logging only) ---
-            if i == 0:  # log first example to avoid flooding
-                metrics = {
-                    "logprobs_policy_ranking": logP_pol.detach().float(),
-                    "logprobs_ref_ranking": logP_ref.detach().float(),
-                    "logprobs_margin": (logP_pol - logP_ref).detach().float(),
-                    "rewards_margin": margin.detach().float(),
-                    "rewards_accuracy": (margin.detach() > 0).float(),
-                }
-
-        # --- Mean loss ---
-        loss = total_loss / batch_size
-
-        # Defensive check
-        if not loss.requires_grad:
-            raise RuntimeError("Loss tensor detached — check detach/item usage above.")
-
-        # --- Logging ---
-        if metrics:
-            safe = {k: (v.item() if torch.is_tensor(v) else v) for k, v in metrics.items()}
-            self.log(safe)
-
+            
+            # Get ranking for this sample
+            q_values = inputs["q_values"][i]
+            generation_order = inputs["generation_order"][i]
+            
+            ranking_indices = get_ranking_from_q_and_genorder(q_values, generation_order)
+            ranking_indices_tensor = torch.tensor(ranking_indices, device=policy_logps.device)
+            
+            # Reorder logprobs according to ranking
+            policy_scores_ranked = policy_logps[ranking_indices_tensor]
+            ref_scores_ranked = ref_logps[ranking_indices_tensor]
+            
+            # Compute Plackett-Luce log probabilities
+            log_p_policy = compute_plackett_luce_logprob(policy_scores_ranked)
+            log_p_ref = compute_plackett_luce_logprob(ref_scores_ranked)
+            
+            # DPO loss
+            logits = self.beta * (log_p_policy - log_p_ref)
+            loss = -F.logsigmoid(logits)
+            
+            losses.append(loss)
+            
+            # Collect metrics
+            all_metrics['logprobs_policy_ranking'].append(log_p_policy.item())
+            all_metrics['logprobs_ref_ranking'].append(log_p_ref.item())
+            all_metrics['logprobs_margin'].append((log_p_policy - log_p_ref).item())
+            all_metrics['rewards_margin'].append(logits.item())
+            all_metrics['rewards_accuracy'].append((logits > 0).float().item())
+        
+        # Average loss
+        if len(losses) == 0:
+            print("[ERROR] No valid losses computed in this batch!")
+            # Return a dummy loss to avoid crash
+            return torch.tensor(0.0, requires_grad=True, device=model.device)
+        
+        loss = torch.stack(losses).mean()
+        
+        # Log averaged metrics
+        for key, values in all_metrics.items():
+            self.log({key: sum(values) / len(values)})
+        
         return (loss, outputs) if return_outputs else loss
 
 
@@ -576,7 +598,7 @@ def train_plackett_luce_dpo(
     )
     
     # Initialize callbacks
-    memory_callback = MemoryCleanupCallback(cleanup_every_n_steps=memory_cleanup_steps)
+    memory_callback = MemoryCleanupCallback(cleanup_every_n_steps=1)  # Clean EVERY step
     save_tokenizer_callback = SaveWithTokenizerCallback(tokenizer=tokenizer, save_steps=save_steps)
     cumulative_metrics_callback = CumulativeMetricsCallback()
     
