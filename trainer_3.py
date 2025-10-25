@@ -368,11 +368,14 @@ class PlackettLuceDPOTrainer(Trainer):
             generation_order = inputs["generation_order"][i]
             
             ranking_indices = get_ranking_from_q_and_genorder(q_values, generation_order)
-            ranking_indices_tensor = torch.tensor(ranking_indices, device=policy_logps.device)
             
-            # Reorder logprobs according to ranking
-            policy_scores_ranked = policy_logps[ranking_indices_tensor]
-            ref_scores_ranked = ref_logps[ranking_indices_tensor]
+            # CRITICAL: Don't create new tensor, use indexing directly
+            # This preserves gradient flow better
+            ranking_indices_list = ranking_indices if isinstance(ranking_indices, list) else ranking_indices.tolist()
+            
+            # Reorder logprobs according to ranking - use list indexing to preserve grads
+            policy_scores_ranked = torch.stack([policy_logps[idx] for idx in ranking_indices_list])
+            ref_scores_ranked = torch.stack([ref_logps[idx] for idx in ranking_indices_list])
             
             # Compute Plackett-Luce log probabilities
             log_p_policy = compute_plackett_luce_logprob(policy_scores_ranked)
